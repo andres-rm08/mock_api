@@ -1,9 +1,9 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, APIRouter, Response, Header, Depends
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Any, Optional
 import json
 import uuid
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 import os
 import tempfile
 import threading
@@ -16,15 +16,12 @@ VALIDATION_FILE = "validation-output.json"
 WEBHOOK_FILE = "webhook_received.json"
 
 _log_lock = threading.Lock()
+_bookings_lock = threading.Lock()
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def append_json_file(path: str, entry: Dict[str, Any]) -> None:
-    """
-    Append an object to a JSON array file. Thread-safe within process via _log_lock.
-    If file doesn't exist or is invalid, create/reset it.
-    """
     with _log_lock:
         try:
             if not os.path.exists(path):
@@ -44,7 +41,6 @@ def append_json_file(path: str, entry: Dict[str, Any]) -> None:
                 json.dump(data, f, ensure_ascii=False, indent=2)
                 f.truncate()
         except Exception:
-
             try:
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump([entry], f, ensure_ascii=False, indent=2)
@@ -52,9 +48,6 @@ def append_json_file(path: str, entry: Dict[str, Any]) -> None:
                 pass
 
 def append_validation(request: Dict[str, Any], response: Dict[str, Any], success: bool = True, endpoint: Optional[str] = None, status_code: Optional[int] = None, extra: Optional[Dict[str, Any]] = None) -> None:
-    """
-    Standardized audit log entry appended to validation-output.json
-    """
     entry = {
         "timestamp": now_iso(),
         "endpoint": endpoint if endpoint else request.get("endpoint"),
@@ -76,10 +69,6 @@ def write_webhook(event_type: str, payload: Dict[str, Any]) -> None:
     append_json_file(WEBHOOK_FILE, entry)
 
 def rotate_validation_log(max_bytes: int = 2_000_000, backup_suffix: str = ".old") -> None:
-    """
-    Optional utility: rotate validation log if it grows beyond max_bytes.
-    Not invoked by the app by default — intended for CI/test wrappers.
-    """
     if not os.path.exists(VALIDATION_FILE):
         return
     size = os.path.getsize(VALIDATION_FILE)
@@ -113,9 +102,6 @@ except FileNotFoundError:
         json.dump(profiles, f, indent=2)
 
 def save_bookings():
-    """
-    Atomic write to DB_FILE to avoid partial/corrupt writes.
-    """
     dirpath = os.path.dirname(os.path.abspath(DB_FILE)) or "."
     fd, tmp_path = tempfile.mkstemp(dir=dirpath)
     try:
@@ -131,9 +117,6 @@ def save_bookings():
         raise
 
 def save_profiles():
-    """
-    Atomic write to PROFILES_FILE to avoid partial/corrupt writes.
-    """
     dirpath = os.path.dirname(os.path.abspath(PROFILES_FILE)) or "."
     fd, tmp_path = tempfile.mkstemp(dir=dirpath)
     try:
@@ -148,10 +131,17 @@ def save_profiles():
             pass
         raise
 
+def normalize_single_booking(b):
+    if "arrival_date" in b and "check_in" not in b:
+        b["check_in"] = b["arrival_date"]
+    if "departure_date" in b and "check_out" not in b:
+        b["check_out"] = b["departure_date"]
+    return b
+
 def normalize_bookings_on_load():
-    """If older bookings lack timestamps, add created_at/updated_at for realism (only on load)."""
     changed = False
     for b in bookings:
+        normalize_single_booking(b)
         if "created_at" not in b:
             b["created_at"] = now_iso()
             changed = True
@@ -232,7 +222,6 @@ class Reservation(BaseModel):
                 if d_dt <= a_dt:
                     raise ValueError("departure_date must be after arrival_date")
             except Exception:
-                
                 raise
         return self
 
@@ -270,46 +259,13 @@ def parse_date(date_str: str) -> datetime:
         if dt.tzinfo is not None:
             dt = dt.replace(tzinfo=None)
         return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid date format: {date_str!r}. Use YYYY-MM-DD or full ISO")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid date format, use YYYY-MM-DD or ISO format")
 
-@app.get("/availability")
-def get_availability(check_in: Optional[str] = Query(None), check_out: Optional[str] = Query(None), include_tentatives: Optional[bool] = Query(False)):
-    today_str = date.today().isoformat()
-    try:
-        check_in_date = parse_date(check_in) if check_in else parse_date(today_str)
-        check_out_date = parse_date(check_out) if check_out else parse_date(today_str)
-    except HTTPException:
-        raise
-
-    availability = {}
-    for room_type, total in ROOM_INVENTORY.items():
-        booked_count = 0
-        for b in bookings:
-            if b["room_type"] != room_type:
-                continue
-            status = b.get("status", "booked")
-            if status not in ["booked", "checked_in", "reserved", "guaranteed"]:
-                continue
-            if not include_tentatives and status == "reserved" and not b.get("guaranteed", False):
-                continue
-
-            b_check_in = parse_date(b["check_in"])
-            b_check_out = parse_date(b["check_out"])
-            if not (check_out_date <= b_check_in or check_in_date >= b_check_out):
-                booked_count += 1
-
-        availability[room_type] = max(0, total - booked_count)
-
-    response = {"rooms_available": availability}
-    append_validation({"endpoint": "/availability", "check_in": check_in, "check_out": check_out, "include_tentatives": include_tentatives}, response, success=True, endpoint="/availability", status_code=200)
-    return response
 
 def check_room_availability(room_type: str, check_in: str, check_out: str, exclude_id: Optional[str] = None, include_tentatives: bool = False) -> bool:
-    """
-    Returns True if room available for the requested date range (exclusive of exclude_id).
-    include_tentatives: if False, only guaranteed/booked/checked_in/guaranteed reservations consume inventory.
-    """
     check_in_date = parse_date(check_in)
     check_out_date = parse_date(check_out)
     booked_count = 0
@@ -381,6 +337,7 @@ def serialize_profile(profile: Dict[str, Any], include_history: bool = False) ->
         serialized["reservation_history"] = history
     return serialized
 
+
 def create_reservation_logic(reservation: Reservation) -> Dict[str, Any]:
     arrival = reservation.arrival_date
     departure = reservation.departure_date
@@ -420,8 +377,9 @@ def create_reservation_logic(reservation: Reservation) -> Dict[str, Any]:
         "currency": r.get("currency"),
         "guest_count": r.get("guest_count", 1),
     }
-    bookings.append(mapped)
-    save_bookings()
+    with _bookings_lock:
+        bookings.append(mapped)
+        save_bookings()
 
     append_validation({"endpoint": "/reservations", "body": reservation.model_dump()}, mapped, success=True, endpoint="/reservations", status_code=201)
     write_webhook("reservation.created", {"reservation_id": rid, "property_id": mapped.get("property_id"), "payload": mapped})
@@ -456,7 +414,8 @@ def update_reservation_logic(res_id: str, reservation: Reservation) -> Dict[str,
             if old_created:
                 b["created_at"] = old_created
             b["updated_at"] = now_iso()
-            save_bookings()
+            with _bookings_lock:
+                save_bookings()
             append_validation({"endpoint": f"/reservations/{res_id}", "body": reservation.model_dump()}, b, success=True, endpoint=f"/reservations/{res_id}", status_code=200)
             write_webhook("reservation.updated", {"reservation_id": res_id, "property_id": b.get("property_id"), "payload": b})
             return b
@@ -467,8 +426,9 @@ def update_reservation_logic(res_id: str, reservation: Reservation) -> Dict[str,
 def delete_reservation_logic(res_id: str) -> Dict[str, Any]:
     for i, b in enumerate(bookings):
         if b.get("id") == res_id or b.get("reservation_id") == res_id:
-            removed = bookings.pop(i)
-            save_bookings()
+            with _bookings_lock:
+                removed = bookings.pop(i)
+                save_bookings()
             deleted_payload = {"reservation_id": res_id, "deleted_at": now_iso(), "original": removed}
             append_validation({"endpoint": f"/reservations/{res_id}"}, deleted_payload, success=True, endpoint=f"/reservations/{res_id}", status_code=200)
             write_webhook("reservation.deleted", {"reservation_id": res_id, "property_id": removed.get("property_id"), "payload": deleted_payload})
@@ -489,7 +449,8 @@ def checkin_logic(res_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Reservation cannot be checked in")
     b["status"] = "checked_in"
     b["updated_at"] = now_iso()
-    save_bookings()
+    with _bookings_lock:
+        save_bookings()
     append_validation({"endpoint": f"/checkin/{res_id}"}, b, success=True, endpoint=f"/checkin/{res_id}", status_code=200)
     write_webhook("reservation.checkin", {"reservation_id": res_id, "property_id": b.get("property_id"), "payload": {"status": b["status"], "updated_at": b["updated_at"]}})
     return {"message": f"Reservation {res_id} checked in", "reservation": b}
@@ -506,44 +467,120 @@ def checkout_logic(res_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Reservation cannot be checked out")
     b["status"] = "checked_out"
     b["updated_at"] = now_iso()
-    save_bookings()
+    with _bookings_lock:
+        save_bookings()
     append_validation({"endpoint": f"/checkout/{res_id}"}, b, success=True, endpoint=f"/checkout/{res_id}", status_code=200)
     write_webhook("reservation.checkout", {"reservation_id": res_id, "property_id": b.get("property_id"), "payload": {"status": b["status"], "updated_at": b["updated_at"]}})
     return {"message": f"Reservation {res_id} checked out", "reservation": b}
 
-@app.get("/reservations", response_model=List[dict])
+
+reservations_router = APIRouter(prefix="/reservations", tags=["reservations"])
+bookings_router = APIRouter(prefix="/bookings", tags=["bookings"])
+profiles_router = APIRouter(prefix="/profiles", tags=["profiles"])
+misc_router = APIRouter(tags=["misc"])
+
+
+@misc_router.get("/availability")
+def get_availability(check_in: Optional[str] = Query(None), check_out: Optional[str] = Query(None), include_tentatives: Optional[bool] = Query(False)):
+    today_str = date.today().isoformat()
+    try:
+        check_in_date = parse_date(check_in) if check_in else parse_date(today_str)
+        if check_out:
+            check_out_date = parse_date(check_out)
+        else:
+            check_out_date = check_in_date + timedelta(days=1)
+    except HTTPException:
+        raise
+
+    availability = {}
+    for room_type, total in ROOM_INVENTORY.items():
+        booked_count = 0
+        for b in bookings:
+            if b["room_type"] != room_type:
+                continue
+            status = b.get("status", "booked")
+            if status not in ["booked", "checked_in", "reserved", "guaranteed"]:
+                continue
+            if not include_tentatives and status == "reserved" and not b.get("guaranteed", False):
+                continue
+
+            b_check_in = parse_date(b["check_in"])
+            b_check_out = parse_date(b["check_out"])
+            if not (check_out_date <= b_check_in or check_in_date >= b_check_out):
+                booked_count += 1
+
+        availability[room_type] = max(0, total - booked_count)
+
+    response = {"rooms_available": availability}
+    append_validation({"endpoint": "/availability", "check_in": check_in, "check_out": check_out, "include_tentatives": include_tentatives}, response, success=True, endpoint="/availability", status_code=200)
+    return response
+
+
+@reservations_router.get("", response_model=List[dict])
 def get_reservations():
     append_validation({"endpoint": "/reservations", "action": "list"}, {"count": len(bookings)}, success=True, endpoint="/reservations", status_code=200)
     return bookings
 
-@app.post("/reservations", status_code=201)
+@reservations_router.post("", status_code=201)
 def create_reservation(reservation: Reservation):
     return create_reservation_logic(reservation)
 
-@app.put("/reservations/{reservation_id}")
+@reservations_router.get("/{reservation_id}", response_model=dict)
+def get_reservation(reservation_id: str):
+
+    b = find_reservation_by_id(reservation_id)
+    if not b:
+
+        b = next(
+            (
+                r for r in bookings
+                if r.get("confirmation_number") == reservation_id
+            ),
+            None,
+        )
+
+    if not b:
+        append_validation(
+            {"endpoint": f"/reservations/{reservation_id}", "action": "get"},
+            {"error": "Reservation not found"},
+            success=False,
+            endpoint=f"/reservations/{reservation_id}",
+            status_code=404,
+        )
+        raise HTTPException(status_code=404, detail="Reservation not found")
+
+    append_validation(
+        {"endpoint": f"/reservations/{reservation_id}", "action": "get"},
+        b,
+        success=True,
+        endpoint=f"/reservations/{reservation_id}",
+        status_code=200,
+    )
+    return b
+
+@reservations_router.put("/{reservation_id}")
 def update_reservation(reservation_id: str, reservation: Reservation):
     return update_reservation_logic(reservation_id, reservation)
 
-@app.delete("/reservations/{reservation_id}")
+@reservations_router.delete("/{reservation_id}")
 def delete_reservation(reservation_id: str):
     return delete_reservation_logic(reservation_id)
 
-@app.post("/checkin/{reservation_id}")
+@reservations_router.post("/checkin/{reservation_id}")
 def reservation_checkin(reservation_id: str):
     return checkin_logic(reservation_id)
 
-@app.post("/checkout/{reservation_id}")
+@reservations_router.post("/checkout/{reservation_id}")
 def reservation_checkout(reservation_id: str):
     return checkout_logic(reservation_id)
 
-@app.get("/bookings", response_model=List[dict])
-def get_bookings_alias():
 
+@bookings_router.get("", response_model=List[dict])
+def get_bookings_alias():
     return get_reservations()
 
-@app.post("/bookings", status_code=201)
+@bookings_router.post("", status_code=201)
 def create_booking_alias(booking: Booking):
-
     res = Reservation(
         property_id="DEFAULT_PROPERTY",
         guest_name=booking.guest_name,
@@ -553,7 +590,11 @@ def create_booking_alias(booking: Booking):
     )
     return create_reservation_logic(res)
 
-@app.put("/bookings/{booking_id}")
+@bookings_router.get("/{booking_id}", response_model=dict)
+def get_booking_alias(booking_id: str):
+    return get_reservation(booking_id)
+
+@bookings_router.put("/{booking_id}")
 def update_booking_alias(booking_id: str, booking: Booking):
     res = Reservation(
         property_id="DEFAULT_PROPERTY",
@@ -564,25 +605,26 @@ def update_booking_alias(booking_id: str, booking: Booking):
     )
     return update_reservation_logic(booking_id, res)
 
-@app.delete("/bookings/{booking_id}")
+@bookings_router.delete("/{booking_id}")
 def delete_booking_alias(booking_id: str):
     return delete_reservation_logic(booking_id)
 
-@app.post("/bookings/checkin/{booking_id}")
+@bookings_router.post("/checkin/{booking_id}")
 def booking_checkin_alias(booking_id: str):
     return checkin_logic(booking_id)
 
-@app.post("/bookings/checkout/{booking_id}")
+@bookings_router.post("/checkout/{booking_id}")
 def booking_checkout_alias(booking_id: str):
     return checkout_logic(booking_id)
 
-@app.get("/profiles", response_model=List[dict])
+
+@profiles_router.get("", response_model=List[dict])
 def list_profiles():
     serialized = [serialize_profile(p) for p in profiles]
     append_validation({"endpoint": "/profiles", "action": "list"}, {"count": len(serialized)}, success=True, endpoint="/profiles", status_code=200)
     return serialized
 
-@app.post("/profiles", status_code=201)
+@profiles_router.post("", status_code=201)
 def create_profile(profile: Profile):
     pid = profile.profile_id or str(uuid.uuid4())
     if profile.profile_id and find_profile_by_id(profile.profile_id):
@@ -603,7 +645,7 @@ def create_profile(profile: Profile):
     write_webhook("profile.created", {"profile_id": pid, "payload": response_payload})
     return response_payload
 
-@app.get("/profiles/{profile_id}")
+@profiles_router.get("/{profile_id}")
 def get_profile(profile_id: str):
     p = find_profile_by_id(profile_id)
     if not p:
@@ -614,7 +656,7 @@ def get_profile(profile_id: str):
     append_validation({"endpoint": f"/profiles/{profile_id}"}, serialized, success=True, endpoint=f"/profiles/{profile_id}", status_code=200)
     return serialized
 
-@app.put("/profiles/{profile_id}")
+@profiles_router.put("/{profile_id}")
 def update_profile(profile_id: str, profile: Profile):
     existing = find_profile_by_id(profile_id)
     if not existing:
@@ -633,7 +675,7 @@ def update_profile(profile_id: str, profile: Profile):
     write_webhook("profile.updated", {"profile_id": profile_id, "payload": serialized})
     return serialized
 
-@app.delete("/profiles/{profile_id}")
+@profiles_router.delete("/{profile_id}")
 def delete_profile(profile_id: str):
     for idx, p in enumerate(profiles):
         if p.get("profile_id") == profile_id:
@@ -646,3 +688,9 @@ def delete_profile(profile_id: str):
 
     append_validation({"endpoint": f"/profiles/{profile_id}"}, {"error": "Profile not found"}, success=False, endpoint=f"/profiles/{profile_id}", status_code=404)
     raise HTTPException(status_code=404, detail="Profile not found")
+
+
+app.include_router(reservations_router)
+app.include_router(bookings_router)
+app.include_router(profiles_router)
+app.include_router(misc_router)
